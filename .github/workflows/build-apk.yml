@@ -72,8 +72,8 @@ jobs:
                   applicationId = "com.cddm.downloader"
                   minSdk = 26
                   targetSdk = 34
-                  versionCode = 2
-                  versionName = "1.1"
+                  versionCode = 3
+                  versionName = "1.2"
               }
 
               signingConfigs {
@@ -208,16 +208,46 @@ jobs:
           </manifest>
           EOF
 
+          cat << 'EOF' > src/main/kotlin/com/abmo/providers/AbyssToProvider.kt
+          package com.abmo.providers
+
+          import com.abmo.util.getHost
+          import com.abmo.util.getParameter
+
+          class AbyssToProvider : Provider {
+              override fun getVideoID(url: String): String? {
+                  val cleanUrl = url.trim()
+                  val host = cleanUrl.getHost().lowercase().removePrefix("www.")
+                  return when {
+                      host in listOf("abysscdn.com", "abyss.to", "playhydrax.com", "zplayer.io", "hydrax.net") -> {
+                          cleanUrl.getParameter("v")
+                              ?: cleanUrl.substringBefore("?").trimEnd('/').substringAfterLast("/")
+                      }
+                      host == "short.ink" -> cleanUrl.substringBefore("?").trimEnd('/').substringAfterLast("/")
+                      cleanUrl.startsWith("http://") || cleanUrl.startsWith("https://") -> {
+                          cleanUrl.getParameter("v")
+                              ?: cleanUrl.substringBefore("?").trimEnd('/').substringAfterLast("/")
+                      }
+                      else -> cleanUrl
+                  }
+              }
+          }
+          EOF
+
           cat << 'EOF' > src/main/kotlin/com/abmo/services/HttpClientManager.kt
           package com.abmo.services
 
           import com.abmo.common.Logger
           import com.abmo.model.HttpResponse
           import com.github.zhkl0228.impersonator.ImpersonatorFactory
+          import com.google.gson.JsonParser
+          import okhttp3.Dns
           import okhttp3.MediaType.Companion.toMediaType
           import okhttp3.OkHttpClient
           import okhttp3.Request
           import okhttp3.RequestBody.Companion.toRequestBody
+          import java.net.InetAddress
+          import java.net.UnknownHostException
           import java.security.KeyStore
           import java.util.concurrent.TimeUnit
           import javax.net.ssl.TrustManagerFactory
@@ -225,11 +255,51 @@ jobs:
 
           class HttpClientManager {
               companion object {
+                  private const val IOS_UA =
+                      "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1"
                   private const val CHROME_UA =
                       "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Mobile Safari/537.36"
               }
 
-              private val impersonatedClient: OkHttpClient by lazy {
+              private val dohClient: OkHttpClient by lazy {
+                  OkHttpClient.Builder()
+                      .connectTimeout(10, TimeUnit.SECONDS)
+                      .readTimeout(10, TimeUnit.SECONDS)
+                      .build()
+              }
+
+              private val smartDns = object : Dns {
+                  override fun lookup(hostname: String): List<InetAddress> {
+                      try {
+                          val sys = Dns.SYSTEM.lookup(hostname)
+                          if (sys.isNotEmpty() && sys.none { it.hostAddress == "0.0.0.0" || it.hostAddress == "127.0.0.1" }) {
+                              return sys
+                          }
+                      } catch (_: Throwable) {}
+
+                      try {
+                          val req = Request.Builder()
+                              .url("https://dns.google/resolve?name=$hostname&type=A")
+                              .build()
+                          val body = dohClient.newCall(req).execute().use { it.body?.string().orEmpty() }
+                          val json = JsonParser.parseString(body).asJsonObject
+                          val answers = json.getAsJsonArray("Answer")
+                          val ips = mutableListOf<InetAddress>()
+                          answers?.forEach { el ->
+                              val obj = el.asJsonObject
+                              if (obj.get("type")?.asInt == 1) {
+                                  val ip = obj.get("data")?.asString
+                                  if (!ip.isNullOrBlank()) ips.add(InetAddress.getByName(ip))
+                              }
+                          }
+                          if (ips.isNotEmpty()) return ips
+                      } catch (_: Throwable) {}
+
+                      throw UnknownHostException("DNS failed for $hostname")
+                  }
+              }
+
+              private val impersonatedClient: OkHttpClient? by lazy {
                   try {
                       val tmf = TrustManagerFactory.getInstance(TrustManagerFactory.getDefaultAlgorithm()).apply {
                           init(null as KeyStore?)
@@ -239,45 +309,68 @@ jobs:
                       val api = ImpersonatorFactory.ios()
                       val sslContext = api.newSSLContext(null, trustManagers)
                       OkHttpClient.Builder()
+                          .dns(smartDns)
                           .sslSocketFactory(sslContext.socketFactory, x509Tm)
-                          .connectTimeout(30, TimeUnit.SECONDS)
-                          .readTimeout(60, TimeUnit.SECONDS)
+                          .connectTimeout(20, TimeUnit.SECONDS)
+                          .readTimeout(30, TimeUnit.SECONDS)
                           .build()
                   } catch (_: Throwable) {
-                      standardClient
+                      null
                   }
               }
 
               private val standardClient: OkHttpClient by lazy {
                   OkHttpClient.Builder()
-                      .connectTimeout(30, TimeUnit.SECONDS)
+                      .dns(smartDns)
+                      .connectTimeout(20, TimeUnit.SECONDS)
                       .readTimeout(60, TimeUnit.SECONDS)
                       .build()
               }
 
               fun makeHttpRequest(url: String, headers: Map<String, String?>? = null): HttpResponse? {
+                  return makeHttpRequestDetailed(url, headers).first
+              }
+
+              fun makeHttpRequestDetailed(url: String, headers: Map<String, String?>? = null): Pair<HttpResponse?, String?> {
                   Logger.debug("Initiating http request to $url")
-                  return try {
-                      val builder = Request.Builder().url(url).header("User-Agent", CHROME_UA)
-                      headers?.forEach { (key, value) ->
-                          if (!value.isNullOrBlank()) builder.header(key, value)
-                      }
-                      impersonatedClient.newCall(builder.build()).execute().use { response ->
-                          HttpResponse(body = response.body?.string(), statusCode = response.code)
-                      }
-                  } catch (e: Throwable) {
+                  var bctlsErr: String? = null
+                  impersonatedClient?.let { client ->
                       try {
-                          val builder = Request.Builder().url(url).header("User-Agent", CHROME_UA)
+                          val builder = Request.Builder()
+                              .url(url)
+                              .header("User-Agent", IOS_UA)
+                              .header("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+                              .header("Accept-Language", "en-US,en;q=0.9")
                           headers?.forEach { (key, value) ->
                               if (!value.isNullOrBlank()) builder.header(key, value)
                           }
-                          standardClient.newCall(builder.build()).execute().use { response ->
-                              HttpResponse(body = response.body?.string(), statusCode = response.code)
+                          client.newCall(builder.build()).execute().use { response ->
+                              val body = response.body?.string()
+                              if (response.code == 200 && !body.isNullOrBlank()) {
+                                  return HttpResponse(body = body, statusCode = response.code) to null
+                              }
+                              bctlsErr = "iOS-TLS HTTP ${response.code}"
                           }
-                      } catch (fallbackErr: Throwable) {
-                          Logger.error("HTTP request failed: ${fallbackErr.message}")
-                          null
+                      } catch (e: Throwable) {
+                          bctlsErr = "iOS-TLS ${e.javaClass.simpleName}: ${e.message}"
                       }
+                  }
+
+                  return try {
+                      val builder = Request.Builder()
+                          .url(url)
+                          .header("User-Agent", CHROME_UA)
+                          .header("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+                          .header("Accept-Language", "en-US,en;q=0.9")
+                      headers?.forEach { (key, value) ->
+                          if (!value.isNullOrBlank()) builder.header(key, value)
+                      }
+                      standardClient.newCall(builder.build()).execute().use { response ->
+                          HttpResponse(body = response.body?.string(), statusCode = response.code) to bctlsErr
+                      }
+                  } catch (e: Throwable) {
+                      val msg = "${e.javaClass.simpleName}: ${e.message}" + (if (bctlsErr != null) " | $bctlsErr" else "")
+                      null to msg
                   }
               }
 
@@ -445,24 +538,55 @@ jobs:
               }
 
               fun getVideoMetaData(url: String, headers: Map<String, String?>?): Mp4? {
-                  val response = httpClientManager.makeHttpRequest(url, headers)
-                  val encryptedData = response?.body ?: return null
-                  return parseEncryptedMp4MetadataFromHtml(encryptedData)
+                  return getVideoMetaDataDetailed(url, headers).first
               }
 
-              private fun parseEncryptedMp4MetadataFromHtml(html: String): Mp4? {
-                  val jsCode = Jsoup.parse(html).select("script").find { it.html().contains("datas") }?.html() ?: return null
-                  val datasRegex = Regex("""const\s+datas\s*=\s*"([^"]*)"""")
-                  val datas = datasRegex.find(jsCode)?.groups?.get(1)?.value ?: return null
-                  val decodedDatas = String(Base64.getDecoder().decode(datas), Charsets.ISO_8859_1)
-                  val mediaMetadata = decodedDatas.toObject<Datas>()
-                  val encryptedMediaMetadata = mediaMetadata.media ?: return null
+              fun getVideoMetaDataDetailed(url: String, headers: Map<String, String?>?): Pair<Mp4?, String> {
+                  val attempts = listOfNotNull(
+                      headers,
+                      mapOf("Referer" to "https://abyss.to/"),
+                      mapOf("Referer" to "https://abysscdn.com/"),
+                      emptyMap()
+                  ).distinct()
 
-                  val mediaKey = "${mediaMetadata.user_id}:${mediaMetadata.slug}:${mediaMetadata.md5_id}"
-                  val decryptionKey = cryptoHelper.getKey(mediaKey).toByteArray()
-                  return cryptoHelper.decryptString(encryptedMediaMetadata, decryptionKey)
-                      .toObject<Video>()
-                      .mp4?.copy(slug = mediaMetadata.slug, md5_id = mediaMetadata.md5_id)
+                  var lastDiag = "No response"
+                  for (hdrs in attempts) {
+                      val (resp, err) = httpClientManager.makeHttpRequestDetailed(url, hdrs)
+                      if (resp == null) {
+                          lastDiag = err ?: "Network error"
+                          continue
+                      }
+                      val body = resp.body.orEmpty()
+                      if (resp.statusCode == 200 && body.isNotBlank()) {
+                          val parsed = parseHtmlToMetadata(body)
+                          if (parsed != null) return parsed to "OK"
+                          val title = try { Jsoup.parse(body).title() } catch (_: Throwable) { "" }
+                          lastDiag = "HTTP 200 (no 'datas' found, title='$title')"
+                      } else {
+                          val title = try { Jsoup.parse(body).title() } catch (_: Throwable) { "" }
+                          lastDiag = "HTTP ${resp.statusCode} (title='$title')"
+                      }
+                  }
+                  return null to lastDiag
+              }
+
+              fun parseHtmlToMetadata(html: String): Mp4? {
+                  return try {
+                      val jsCode = Jsoup.parse(html).select("script").find { it.html().contains("datas") }?.html() ?: return null
+                      val datasRegex = Regex("""(?:const|let|var)?\s*datas\s*=\s*["']([^"']+)["']""")
+                      val datas = datasRegex.find(jsCode)?.groups?.get(1)?.value ?: return null
+                      val decodedDatas = String(Base64.getDecoder().decode(datas), Charsets.ISO_8859_1)
+                      val mediaMetadata = decodedDatas.toObject<Datas>()
+                      val encryptedMediaMetadata = mediaMetadata.media ?: return null
+
+                      val mediaKey = "${mediaMetadata.user_id}:${mediaMetadata.slug}:${mediaMetadata.md5_id}"
+                      val decryptionKey = cryptoHelper.getKey(mediaKey).toByteArray()
+                      cryptoHelper.decryptString(encryptedMediaMetadata, decryptionKey)
+                          .toObject<Video>()
+                          .mp4?.copy(slug = mediaMetadata.slug, md5_id = mediaMetadata.md5_id)
+                  } catch (_: Throwable) {
+                      null
+                  }
               }
 
               private fun initializeDownloadTempDir(config: Config, simpleVideo: SimpleVideo?, totalSegments: Int): Pair<File, List<Int>> {
@@ -608,6 +732,8 @@ jobs:
           import android.view.Gravity
           import android.view.View
           import android.view.WindowManager
+          import android.webkit.WebView
+          import android.webkit.WebViewClient
           import android.widget.*
           import com.abmo.common.Constants.ABYSS_BASE_URL
           import com.abmo.di.koinModule
@@ -619,12 +745,14 @@ jobs:
           import com.abmo.util.extractReferer
           import com.abmo.util.formatAsReadableSize
           import com.abmo.util.isValidUrl
+          import com.google.gson.Gson
           import kotlinx.coroutines.*
           import org.koin.core.context.GlobalContext
           import org.koin.core.context.startKoin
           import java.io.File
           import java.io.FileInputStream
           import java.io.FileOutputStream
+          import kotlin.coroutines.resume
 
           class MainActivity : Activity() {
               private val scope = CoroutineScope(Dispatchers.Main + SupervisorJob())
@@ -799,27 +927,50 @@ jobs:
                       try {
                           val dispatcher = GlobalContext.get().get<ProviderDispatcher>()
                           val downloader = GlobalContext.get().get<VideoDownloader>()
-                          val result = withContext(Dispatchers.IO) {
-                              val videoId = dispatcher.getProviderForUrl(raw).getVideoID(raw)
-                                  ?: throw Exception("Could not extract Video ID")
+
+                          val prep = withContext(Dispatchers.IO) {
+                              val videoId = dispatcher.getProviderForUrl(raw).getVideoID(raw)?.trim()
+                                  ?: throw Exception("Could not extract Video ID from: $raw")
                               val headers = if (raw.isValidUrl()) {
                                   mapOf("Referer" to (raw.extractReferer() ?: "$ABYSS_BASE_URL/"))
                               } else {
-                                  mapOf("Referer" to "$ABYSS_BASE_URL/")
+                                  mapOf("Referer" to "https://abyss.to/")
                               }
                               val abyssUrl = "$ABYSS_BASE_URL/?v=$videoId"
-                              val meta = downloader.getVideoMetaData(abyssUrl, headers)
-                                  ?: throw Exception("Video not found or blocked by server")
-                              Triple(videoId, abyssUrl, headers) to meta
+                              Triple(videoId, abyssUrl, headers)
                           }
-                          currentVideoId = result.first.first
-                          currentAbyssUrl = result.first.second
-                          currentHeaders = result.first.third
-                          currentMetadata = result.second
 
-                          val sources = result.second.sources?.filterNotNull()?.sortedByDescending { it.size ?: 0L } ?: emptyList()
+                          currentVideoId = prep.first
+                          currentAbyssUrl = prep.second
+                          currentHeaders = prep.third
+
+                          var (meta, diag) = withContext(Dispatchers.IO) {
+                              downloader.getVideoMetaDataDetailed(currentAbyssUrl, currentHeaders)
+                          }
+
+                          if (meta == null) {
+                              statusText.text = "Direct fetch ($diag). Trying browser engine..."
+                              val webHtml = fetchHtmlViaWebView(currentAbyssUrl, currentHeaders["Referer"] ?: "https://abyss.to/")
+                              if (!webHtml.isNullOrBlank()) {
+                                  meta = withContext(Dispatchers.IO) { downloader.parseHtmlToMetadata(webHtml) }
+                                  if (meta == null) {
+                                      val webPreview = webHtml.replace(Regex("<[^>]+>"), " ").replace(Regex("\\s+"), " ").trim().take(120)
+                                      diag = "$diag | WebView: $webPreview"
+                                  }
+                              } else {
+                                  diag = "$diag | WebView: empty"
+                              }
+                          }
+
+                          if (meta == null) {
+                              statusText.text = "Failed [ID=$currentVideoId]: $diag"
+                              return@launch
+                          }
+
+                          currentMetadata = meta
+                          val sources = meta.sources?.filterNotNull()?.sortedByDescending { it.size ?: 0L } ?: emptyList()
                           if (sources.isEmpty()) {
-                              statusText.text = "No downloadable formats found."
+                              statusText.text = "No downloadable formats found for ID=$currentVideoId."
                           } else {
                               statusText.text = "Found ${sources.size} format(s) for $currentVideoId. Tap one to download:"
                               sources.forEach { addFormatButton(it) }
@@ -828,6 +979,51 @@ jobs:
                           statusText.text = "Error: ${e.message ?: e.javaClass.simpleName}"
                       } finally {
                           fetchBtn.isEnabled = true
+                      }
+                  }
+              }
+
+              private suspend fun fetchHtmlViaWebView(url: String, referer: String): String? = withTimeoutOrNull(10000L) {
+                  withContext(Dispatchers.Main) {
+                      val webView = WebView(this@MainActivity)
+                      try {
+                          webView.settings.javaScriptEnabled = true
+                          webView.settings.domStorageEnabled = true
+                          var pageLoaded = false
+                          webView.webViewClient = object : WebViewClient() {
+                              override fun onPageFinished(view: WebView?, loadedUrl: String?) {
+                                  pageLoaded = true
+                              }
+                          }
+                          webView.loadUrl(url, mapOf("Referer" to referer))
+                          val gson = Gson()
+                          for (i in 0 until 16) {
+                              delay(500)
+                              if (pageLoaded || i >= 4) {
+                                  val html = evalWebViewHtml(webView, gson)
+                                  if (!html.isNullOrBlank() && html.contains("datas")) {
+                                      return@withContext html
+                                  }
+                                  if (pageLoaded && i >= 6 && !html.isNullOrBlank() && !html.contains("Just a moment", ignoreCase = true)) {
+                                      return@withContext html
+                                  }
+                              }
+                          }
+                          evalWebViewHtml(webView, gson)
+                      } finally {
+                          webView.stopLoading()
+                          webView.destroy()
+                      }
+                  }
+              }
+
+              private suspend fun evalWebViewHtml(webView: WebView, gson: Gson): String? = suspendCancellableCoroutine { cont ->
+                  webView.evaluateJavascript("(function(){ return document.documentElement ? document.documentElement.outerHTML : ''; })();") { raw ->
+                      if (cont.isActive) {
+                          val decoded = try {
+                              if (raw == null || raw == "null") null else gson.fromJson(raw, String::class.java)
+                          } catch (_: Throwable) { null }
+                          cont.resume(decoded)
                       }
                   }
               }
@@ -954,7 +1150,7 @@ jobs:
       - name: Publish Public Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v1.1-${{ github.run_number }}
-          name: CDdm APK v1.1-${{ github.run_number }}
+          tag_name: v1.2-${{ github.run_number }}
+          name: CDdm APK v1.2-${{ github.run_number }}
           files: CDdm.apk
           draft: false
