@@ -1,4 +1,4 @@
-name: Auto Patch and Build Android APK
+name: Build CDdm Android APK
 
 on:
   push:
@@ -17,9 +17,9 @@ jobs:
       - name: Checkout Forked Repo
         uses: actions/checkout@v4
 
-      - name: Auto-Patch Project for Android
+      - name: Auto-Patch Project for CDdm Android
         run: |
-          mkdir -p src/main/kotlin/com/abmo/services src/main/kotlin/com/abmo/providers
+          mkdir -p src/main/kotlin/com/abmo/services src/main/kotlin/com/abmo/providers src/main/res/drawable src/main/res/mipmap-anydpi-v26
           sed -i 's/gradle-8.5-bin.zip/gradle-8.6-bin.zip/g' gradle/wrapper/gradle-wrapper.properties
 
           cat << 'EOF' > settings.gradle.kts
@@ -37,7 +37,7 @@ jobs:
                   mavenCentral()
               }
           }
-          rootProject.name = "AbyssVideoDownloader"
+          rootProject.name = "CDdm"
           EOF
 
           cat << 'EOF' > gradle.properties
@@ -69,16 +69,30 @@ jobs:
               compileSdk = 34
 
               defaultConfig {
-                  applicationId = "com.abmo.abyssdownloader"
+                  applicationId = "com.cddm.downloader"
                   minSdk = 26
                   targetSdk = 34
-                  versionCode = 1
-                  versionName = "1.0"
+                  versionCode = 2
+                  versionName = "1.1"
+              }
+
+              signingConfigs {
+                  create("release") {
+                      storeFile = file("cddm-release.jks")
+                      storePassword = "cddm1234"
+                      keyAlias = "cddm"
+                      keyPassword = "cddm1234"
+                  }
               }
 
               buildTypes {
-                  debug { isMinifyEnabled = false }
-                  release { isMinifyEnabled = false }
+                  release {
+                      isMinifyEnabled = false
+                      signingConfig = signingConfigs.getByName("release")
+                  }
+                  debug {
+                      isMinifyEnabled = false
+                  }
               }
 
               compileOptions {
@@ -122,10 +136,53 @@ jobs:
               implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:$kotlinCoroutinesVersion")
               implementation("org.jsoup:jsoup:$jsoupVersion")
               implementation("io.insert-koin:koin-core:$koinVersion")
-              implementation("com.github.zhkl0228:impersonator-okhttp:1.0.8")
+              implementation("com.squareup.okhttp3:okhttp:4.12.0")
+              implementation("com.github.zhkl0228:impersonator-bctls:1.0.8")
               implementation("org.slf4j:slf4j-nop:2.0.16")
           }
           EOF
+
+          cat << 'EOF' > src/main/res/drawable/ic_launcher_background.xml
+          <?xml version="1.0" encoding="utf-8"?>
+          <vector xmlns:android="http://schemas.android.com/apk/res/android"
+              android:width="108dp"
+              android:height="108dp"
+              android:viewportWidth="108"
+              android:viewportHeight="108">
+              <path
+                  android:fillColor="#0F172A"
+                  android:pathData="M0,0 L108,0 L108,108 L0,108 Z" />
+          </vector>
+          EOF
+
+          cat << 'EOF' > src/main/res/drawable/ic_launcher_foreground.xml
+          <?xml version="1.0" encoding="utf-8"?>
+          <vector xmlns:android="http://schemas.android.com/apk/res/android"
+              android:width="108dp"
+              android:height="108dp"
+              android:viewportWidth="108"
+              android:viewportHeight="108">
+              <path
+                  android:fillColor="#10B981"
+                  android:pathData="M54,24 A30,30 0 1,0 54,84 A30,30 0 1,0 54,24 Z" />
+              <path
+                  android:fillColor="#FFFFFF"
+                  android:pathData="M50,36 L58,36 L58,54 L66,54 L54,68 L42,54 L50,54 Z" />
+              <path
+                  android:fillColor="#FFFFFF"
+                  android:pathData="M40,70 L68,70 L68,75 L40,75 Z" />
+          </vector>
+          EOF
+
+          cat << 'EOF' > src/main/res/mipmap-anydpi-v26/ic_launcher.xml
+          <?xml version="1.0" encoding="utf-8"?>
+          <adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
+              <background android:drawable="@drawable/ic_launcher_background" />
+              <foreground android:drawable="@drawable/ic_launcher_foreground" />
+          </adaptive-icon>
+          EOF
+
+          cp src/main/res/mipmap-anydpi-v26/ic_launcher.xml src/main/res/mipmap-anydpi-v26/ic_launcher_round.xml
 
           cat << 'EOF' > src/main/AndroidManifest.xml
           <?xml version="1.0" encoding="utf-8"?>
@@ -134,9 +191,10 @@ jobs:
               <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" android:maxSdkVersion="28" />
               <application
                   android:allowBackup="true"
-                  android:label="Abyss Downloader"
-                  android:theme="@android:style/Theme.Material.NoActionBar"
-                  android:usesCleartextTraffic="true">
+                  android:icon="@mipmap/ic_launcher"
+                  android:roundIcon="@mipmap/ic_launcher_round"
+                  android:label="CDdm"
+                  android:theme="@android:style/Theme.Material.NoActionBar">
                   <activity
                       android:name="com.abmo.MainActivity"
                       android:exported="true"
@@ -158,20 +216,36 @@ jobs:
           import com.github.zhkl0228.impersonator.ImpersonatorFactory
           import okhttp3.MediaType.Companion.toMediaType
           import okhttp3.OkHttpClient
-          import okhttp3.OkHttpClientFactory
           import okhttp3.Request
           import okhttp3.RequestBody.Companion.toRequestBody
+          import java.security.KeyStore
           import java.util.concurrent.TimeUnit
+          import javax.net.ssl.TrustManagerFactory
+          import javax.net.ssl.X509TrustManager
 
           class HttpClientManager {
+              companion object {
+                  private const val CHROME_UA =
+                      "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Mobile Safari/537.36"
+              }
+
               private val impersonatedClient: OkHttpClient by lazy {
-                  val api = ImpersonatorFactory.ios()
-                  api.newSSLContext(null, null)
-                  OkHttpClientFactory.create(api).newHttpClient()
-                      .newBuilder()
-                      .connectTimeout(30, TimeUnit.SECONDS)
-                      .readTimeout(60, TimeUnit.SECONDS)
-                      .build()
+                  try {
+                      val tmf = TrustManagerFactory.getInstance(TrustManagerFactory.getDefaultAlgorithm()).apply {
+                          init(null as KeyStore?)
+                      }
+                      val trustManagers = tmf.trustManagers
+                      val x509Tm = trustManagers.filterIsInstance<X509TrustManager>().first()
+                      val api = ImpersonatorFactory.ios()
+                      val sslContext = api.newSSLContext(null, trustManagers)
+                      OkHttpClient.Builder()
+                          .sslSocketFactory(sslContext.socketFactory, x509Tm)
+                          .connectTimeout(30, TimeUnit.SECONDS)
+                          .readTimeout(60, TimeUnit.SECONDS)
+                          .build()
+                  } catch (_: Throwable) {
+                      standardClient
+                  }
               }
 
               private val standardClient: OkHttpClient by lazy {
@@ -184,16 +258,26 @@ jobs:
               fun makeHttpRequest(url: String, headers: Map<String, String?>? = null): HttpResponse? {
                   Logger.debug("Initiating http request to $url")
                   return try {
-                      val builder = Request.Builder().url(url)
+                      val builder = Request.Builder().url(url).header("User-Agent", CHROME_UA)
                       headers?.forEach { (key, value) ->
-                          if (!value.isNullOrBlank()) builder.addHeader(key, value)
+                          if (!value.isNullOrBlank()) builder.header(key, value)
                       }
                       impersonatedClient.newCall(builder.build()).execute().use { response ->
                           HttpResponse(body = response.body?.string(), statusCode = response.code)
                       }
-                  } catch (e: Exception) {
-                      Logger.error("HTTP request failed: ${e.message}")
-                      null
+                  } catch (e: Throwable) {
+                      try {
+                          val builder = Request.Builder().url(url).header("User-Agent", CHROME_UA)
+                          headers?.forEach { (key, value) ->
+                              if (!value.isNullOrBlank()) builder.header(key, value)
+                          }
+                          standardClient.newCall(builder.build()).execute().use { response ->
+                              HttpResponse(body = response.body?.string(), statusCode = response.code)
+                          }
+                      } catch (fallbackErr: Throwable) {
+                          Logger.error("HTTP request failed: ${fallbackErr.message}")
+                          null
+                      }
                   }
               }
 
@@ -201,14 +285,16 @@ jobs:
                   val mediaType = "application/x-www-form-urlencoded; charset=UTF-8".toMediaType()
                   val builder = Request.Builder()
                       .url(url)
+                      .header("User-Agent", CHROME_UA)
                       .post(formBody.toRequestBody(mediaType))
-                  headers.forEach { (k, v) -> builder.addHeader(k, v) }
+                  headers.forEach { (k, v) -> builder.header(k, v) }
                   return standardClient.newCall(builder.build()).execute().use { it.body?.string().orEmpty() }
               }
 
               fun openSegmentStream(url: String, referer: String = "https://abysscdn.com/"): okhttp3.Response {
                   val request = Request.Builder()
                       .url(url)
+                      .header("User-Agent", CHROME_UA)
                       .header("Referer", referer)
                       .build()
                   return standardClient.newCall(request).execute()
@@ -310,7 +396,7 @@ jobs:
               }
 
               private suspend fun downloadSegmentWithRetry(url: String, targetFile: File, bytesCounter: AtomicLong) {
-                  var lastError: Exception? = null
+                  var lastError: Throwable? = null
                   repeat(MAX_RETRIES) { attempt ->
                       try {
                           if (targetFile.exists()) targetFile.delete()
@@ -327,7 +413,7 @@ jobs:
                               }
                           }
                           return
-                      } catch (e: Exception) {
+                      } catch (e: Throwable) {
                           lastError = e
                           if (attempt < MAX_RETRIES - 1) delay(1000L * (attempt + 1))
                       }
@@ -559,15 +645,24 @@ jobs:
 
               override fun onCreate(savedInstanceState: Bundle?) {
                   super.onCreate(savedInstanceState)
-                  if (GlobalContext.getOrNull() == null) {
-                      startKoin { modules(koinModule) }
-                  }
-                  if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
-                      if (checkSelfPermission(Manifest.permission.WRITE_EXTERNAL_STORAGE) != PackageManager.PERMISSION_GRANTED) {
-                          requestPermissions(arrayOf(Manifest.permission.WRITE_EXTERNAL_STORAGE), 101)
+                  try {
+                      if (GlobalContext.getOrNull() == null) {
+                          startKoin { modules(koinModule) }
                       }
+                      if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
+                          if (checkSelfPermission(Manifest.permission.WRITE_EXTERNAL_STORAGE) != PackageManager.PERMISSION_GRANTED) {
+                              requestPermissions(arrayOf(Manifest.permission.WRITE_EXTERNAL_STORAGE), 101)
+                          }
+                      }
+                      buildUi()
+                  } catch (e: Throwable) {
+                      val errView = TextView(this).apply {
+                          setPadding(40, 80, 40, 40)
+                          setTextColor(Color.RED)
+                          text = "Startup Error:\n${e.stackTraceToString()}"
+                      }
+                      setContentView(ScrollView(this).apply { addView(errView) })
                   }
-                  buildUi()
               }
 
               private fun dp(v: Int): Int = (v * resources.displayMetrics.density).toInt()
@@ -586,13 +681,13 @@ jobs:
                       setPadding(dp(20), dp(28), dp(20), dp(28))
                   }
                   val title = TextView(this).apply {
-                      text = "Abyss Video Downloader"
-                      textSize = 24f
+                      text = "CDdm"
+                      textSize = 26f
                       setTypeface(null, Typeface.BOLD)
                       setTextColor(Color.WHITE)
                   }
                   val subtitle = TextView(this).apply {
-                      text = "All qualities • Multi-thread high speed • Save to Downloads"
+                      text = "All qualities up to 4K • Multi-thread high speed • Downloads/CDdm"
                       textSize = 13f
                       setTextColor(Color.parseColor("#94A3B8"))
                       setPadding(0, dp(4), 0, dp(18))
@@ -615,9 +710,14 @@ jobs:
                       background = cardBg("#334155", 10)
                       layoutParams = LinearLayout.LayoutParams(0, dp(48), 1f).apply { rightMargin = dp(8) }
                       setOnClickListener {
-                          val cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-                          val clip = cm.primaryClip?.getItemAt(0)?.text?.toString()?.trim()
-                          if (!clip.isNullOrEmpty()) urlInput.setText(clip)
+                          try {
+                              val cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                              val clip = cm.primaryClip
+                              if (clip != null && clip.itemCount > 0) {
+                                  val txt = clip.getItemAt(0).coerceToText(this@MainActivity)?.toString()?.trim()
+                                  if (!txt.isNullOrEmpty()) urlInput.setText(txt)
+                              }
+                          } catch (_: Throwable) {}
                       }
                   }
                   fetchBtn = Button(this).apply {
@@ -724,8 +824,8 @@ jobs:
                               statusText.text = "Found ${sources.size} format(s) for $currentVideoId. Tap one to download:"
                               sources.forEach { addFormatButton(it) }
                           }
-                      } catch (e: Exception) {
-                          statusText.text = "Error: ${e.message}"
+                      } catch (e: Throwable) {
+                          statusText.text = "Error: ${e.message ?: e.javaClass.simpleName}"
                       } finally {
                           fetchBtn.isEnabled = true
                       }
@@ -778,10 +878,10 @@ jobs:
                           val savedName = "${currentVideoId}_${resolutionLabel}.mp4"
                           withContext(Dispatchers.IO) { saveToDownloads(tempOutput, savedName) }
                           progressBar.progress = 100
-                          statusText.text = "Saved to Downloads/AbyssDownloader/$savedName"
+                          statusText.text = "Saved to Downloads/CDdm/$savedName"
                           Toast.makeText(this@MainActivity, "Download Complete!", Toast.LENGTH_LONG).show()
-                      } catch (e: Exception) {
-                          statusText.text = "Download failed: ${e.message}"
+                      } catch (e: Throwable) {
+                          statusText.text = "Download failed: ${e.message ?: e.javaClass.simpleName}"
                           if (tempOutput.exists()) tempOutput.delete()
                       } finally {
                           isDownloading = false
@@ -796,7 +896,7 @@ jobs:
                       val values = ContentValues().apply {
                           put(MediaStore.Downloads.DISPLAY_NAME, fileName)
                           put(MediaStore.Downloads.MIME_TYPE, "video/mp4")
-                          put(MediaStore.Downloads.RELATIVE_PATH, "${Environment.DIRECTORY_DOWNLOADS}/AbyssDownloader")
+                          put(MediaStore.Downloads.RELATIVE_PATH, "${Environment.DIRECTORY_DOWNLOADS}/CDdm")
                       }
                       val uri = contentResolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
                           ?: throw Exception("Failed to create MediaStore entry")
@@ -804,7 +904,7 @@ jobs:
                           FileInputStream(sourceFile).use { input -> input.copyTo(out) }
                       }
                   } else {
-                      val dir = File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS), "AbyssDownloader")
+                      val dir = File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS), "CDdm")
                       if (!dir.exists()) dir.mkdirs()
                       FileInputStream(sourceFile).use { input ->
                           FileOutputStream(File(dir, fileName)).use { out -> input.copyTo(out) }
@@ -829,25 +929,32 @@ jobs:
       - name: Setup Android SDK
         uses: android-actions/setup-android@v4
 
+      - name: Generate Release Keystore
+        run: |
+          keytool -genkeypair -v -keystore cddm-release.jks -alias cddm \
+            -keyalg RSA -keysize 2048 -validity 10000 \
+            -storepass cddm1234 -keypass cddm1234 \
+            -dname "CN=CDdm, OU=Mobile, O=CDdm, L=IN, S=IN, C=IN"
+
       - name: Make gradlew executable
         run: chmod +x gradlew
 
-      - name: Build Android APK
-        run: ./gradlew assembleDebug
+      - name: Build Signed Release APK
+        run: ./gradlew assembleRelease
 
       - name: Rename APK
-        run: cp build/outputs/apk/debug/*.apk AbyssDownloader.apk
+        run: cp build/outputs/apk/release/*.apk CDdm.apk
 
       - name: Upload APK Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: AbyssDownloader-APK
-          path: AbyssDownloader.apk
+          name: CDdm-APK
+          path: CDdm.apk
 
       - name: Publish Public Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v1.0-${{ github.run_number }}
-          name: AbyssDownloader APK v1.0-${{ github.run_number }}
-          files: AbyssDownloader.apk
+          tag_name: v1.1-${{ github.run_number }}
+          name: CDdm APK v1.1-${{ github.run_number }}
+          files: CDdm.apk
           draft: false
