@@ -1,0 +1,852 @@
+name: Auto Patch and Build Android APK
+
+on:
+  push:
+    branches:
+      - master
+      - main
+  workflow_dispatch:
+
+jobs:
+  build-apk:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout Forked Repo
+        uses: actions/checkout@v4
+
+      - name: Auto-Patch Project for Android
+        run: |
+          mkdir -p src/main/kotlin/com/abmo/services src/main/kotlin/com/abmo/providers
+
+          cat << 'EOF' > settings.gradle.kts
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = "AbyssVideoDownloader"
+          EOF
+
+          cat << 'EOF' > gradle.properties
+          kotlin.code.style=official
+          org.gradle.jvmargs=-Xmx2048m -Dfile.encoding=UTF-8
+          android.useAndroidX=true
+          android.nonTransitiveRClass=true
+          koinVersion=4.0.0
+          gsonVersion=2.11.0
+          rhinoVersion=1.7.15
+          kotlinCoroutinesVersion=1.9.0
+          jsoupVersion=1.18.1
+          EOF
+
+          cat << 'EOF' > build.gradle.kts
+          val koinVersion: String by project
+          val gsonVersion: String by project
+          val rhinoVersion: String by project
+          val kotlinCoroutinesVersion: String by project
+          val jsoupVersion: String by project
+
+          plugins {
+              id("com.android.application") version "8.4.2"
+              id("org.jetbrains.kotlin.android") version "2.0.0"
+          }
+
+          android {
+              namespace = "com.abmo"
+              compileSdk = 34
+
+              defaultConfig {
+                  applicationId = "com.abmo.abyssdownloader"
+                  minSdk = 26
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+
+              buildTypes {
+                  debug { isMinifyEnabled = false }
+                  release { isMinifyEnabled = false }
+              }
+
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+
+              kotlinOptions { jvmTarget = "17" }
+
+              sourceSets {
+                  getByName("main") {
+                      java.srcDirs("src/main/kotlin")
+                      resources.srcDirs("src/main/resources")
+                  }
+              }
+
+              packaging {
+                  resources {
+                      excludes += setOf(
+                          "META-INF/DEPENDENCIES",
+                          "META-INF/LICENSE",
+                          "META-INF/LICENSE.txt",
+                          "META-INF/license.txt",
+                          "META-INF/NOTICE",
+                          "META-INF/NOTICE.txt",
+                          "META-INF/notice.txt",
+                          "META-INF/INDEX.LIST",
+                          "META-INF/versions/*/OSGI-INF/MANIFEST.MF",
+                          "META-INF/*.SF",
+                          "META-INF/*.DSA",
+                          "META-INF/*.RSA"
+                      )
+                  }
+              }
+          }
+
+          dependencies {
+              implementation("com.google.code.gson:gson:$gsonVersion")
+              implementation("org.mozilla:rhino:$rhinoVersion")
+              implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:$kotlinCoroutinesVersion")
+              implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:$kotlinCoroutinesVersion")
+              implementation("org.jsoup:jsoup:$jsoupVersion")
+              implementation("io.insert-koin:koin-core:$koinVersion")
+              implementation("com.github.zhkl0228:impersonator-okhttp:1.0.8")
+              implementation("org.slf4j:slf4j-nop:2.0.16")
+          }
+          EOF
+
+          cat << 'EOF' > src/main/AndroidManifest.xml
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.INTERNET" />
+              <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" android:maxSdkVersion="28" />
+              <application
+                  android:allowBackup="true"
+                  android:label="Abyss Downloader"
+                  android:theme="@android:style/Theme.Material.NoActionBar"
+                  android:usesCleartextTraffic="true">
+                  <activity
+                      android:name="com.abmo.MainActivity"
+                      android:exported="true"
+                      android:windowSoftInputMode="adjustResize">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          EOF
+
+          cat << 'EOF' > src/main/kotlin/com/abmo/services/HttpClientManager.kt
+          package com.abmo.services
+
+          import com.abmo.common.Logger
+          import com.abmo.model.HttpResponse
+          import com.github.zhkl0228.impersonator.ImpersonatorFactory
+          import okhttp3.MediaType.Companion.toMediaType
+          import okhttp3.OkHttpClient
+          import okhttp3.OkHttpClientFactory
+          import okhttp3.Request
+          import okhttp3.RequestBody.Companion.toRequestBody
+          import java.util.concurrent.TimeUnit
+
+          class HttpClientManager {
+              private val impersonatedClient: OkHttpClient by lazy {
+                  val api = ImpersonatorFactory.ios()
+                  api.newSSLContext(null, null)
+                  OkHttpClientFactory.create(api).newHttpClient()
+                      .newBuilder()
+                      .connectTimeout(30, TimeUnit.SECONDS)
+                      .readTimeout(60, TimeUnit.SECONDS)
+                      .build()
+              }
+
+              private val standardClient: OkHttpClient by lazy {
+                  OkHttpClient.Builder()
+                      .connectTimeout(30, TimeUnit.SECONDS)
+                      .readTimeout(60, TimeUnit.SECONDS)
+                      .build()
+              }
+
+              fun makeHttpRequest(url: String, headers: Map<String, String?>? = null): HttpResponse? {
+                  Logger.debug("Initiating http request to $url")
+                  return try {
+                      val builder = Request.Builder().url(url)
+                      headers?.forEach { (key, value) ->
+                          if (!value.isNullOrBlank()) builder.addHeader(key, value)
+                      }
+                      impersonatedClient.newCall(builder.build()).execute().use { response ->
+                          HttpResponse(body = response.body?.string(), statusCode = response.code)
+                      }
+                  } catch (e: Exception) {
+                      Logger.error("HTTP request failed: ${e.message}")
+                      null
+                  }
+              }
+
+              fun postForm(url: String, formBody: String, headers: Map<String, String> = emptyMap()): String {
+                  val mediaType = "application/x-www-form-urlencoded; charset=UTF-8".toMediaType()
+                  val builder = Request.Builder()
+                      .url(url)
+                      .post(formBody.toRequestBody(mediaType))
+                  headers.forEach { (k, v) -> builder.addHeader(k, v) }
+                  return standardClient.newCall(builder.build()).execute().use { it.body?.string().orEmpty() }
+              }
+
+              fun openSegmentStream(url: String, referer: String = "https://abysscdn.com/"): okhttp3.Response {
+                  val request = Request.Builder()
+                      .url(url)
+                      .header("Referer", referer)
+                      .build()
+                  return standardClient.newCall(request).execute()
+              }
+          }
+          EOF
+
+          cat << 'EOF' > src/main/kotlin/com/abmo/services/VideoDownloader.kt
+          package com.abmo.services
+
+          import com.abmo.crypto.CryptoHelper
+          import com.abmo.model.Config
+          import com.abmo.model.Datas
+          import com.abmo.model.SimpleVideo
+          import com.abmo.model.video.Mp4
+          import com.abmo.model.video.Video
+          import com.abmo.model.video.toSimpleVideo
+          import com.abmo.util.toObject
+          import kotlinx.coroutines.*
+          import kotlinx.coroutines.sync.Semaphore
+          import kotlinx.coroutines.sync.withPermit
+          import org.jsoup.Jsoup
+          import org.koin.core.component.KoinComponent
+          import org.koin.core.component.inject
+          import java.io.BufferedOutputStream
+          import java.io.File
+          import java.io.FileInputStream
+          import java.io.FileOutputStream
+          import java.io.IOException
+          import java.util.Base64
+          import java.util.concurrent.atomic.AtomicInteger
+          import java.util.concurrent.atomic.AtomicLong
+
+          class VideoDownloader : KoinComponent {
+              private val cryptoHelper: CryptoHelper by inject()
+              private val httpClientManager: HttpClientManager by inject()
+
+              companion object {
+                  private const val FRAGMENT_SIZE_IN_BYTES = 2097152L
+                  private const val MAX_RETRIES = 3
+              }
+
+              suspend fun downloadSegmentsInParallel(
+                  config: Config,
+                  videoMetadata: Mp4?,
+                  onProgress: ((percent: Int, downloadedBytes: Long, totalBytes: Long, speedBytesPerSec: Long, status: String) -> Unit)? = null
+              ) {
+                  val simpleVideo = videoMetadata?.toSimpleVideo(config.resolution)
+                      ?: throw IOException("Selected quality not found")
+                  val segmentTokens = generateSegmentTokens(simpleVideo)
+                  if (segmentTokens.isEmpty()) throw IOException("Failed to generate download tokens")
+
+                  val tempDir = initializeDownloadTempDir(config, simpleVideo, segmentTokens.size)
+                  val segmentsToDownload = segmentTokens.filter { (index, _) -> index in tempDir.second }.ifEmpty {
+                      segmentTokens
+                  }
+
+                  val semaphore = Semaphore(config.connections)
+                  val totalSegments = segmentTokens.size
+                  val mediaSize = simpleVideo.size ?: (totalSegments * FRAGMENT_SIZE_IN_BYTES)
+                  val alreadyDownloadedSegments = totalSegments - segmentsToDownload.size
+                  val downloadedSegments = AtomicInteger(alreadyDownloadedSegments)
+                  val totalBytesDownloaded = AtomicLong(alreadyDownloadedSegments * FRAGMENT_SIZE_IN_BYTES)
+                  val startTime = System.currentTimeMillis()
+
+                  coroutineScope {
+                      val downloadJobs = segmentsToDownload.entries.map { segmentToken ->
+                          val segmentUrl = "${simpleVideo.url}/sora/${simpleVideo.size}/${segmentToken.value}"
+                          async(Dispatchers.IO) {
+                              val index = segmentToken.key
+                              semaphore.withPermit {
+                                  downloadSegmentWithRetry(segmentUrl, File(tempDir.first, "segment_$index"), totalBytesDownloaded)
+                              }
+                              downloadedSegments.incrementAndGet()
+                          }
+                      }
+
+                      val progressJob = launch {
+                          while (isActive) {
+                              val downloaded = totalBytesDownloaded.get().coerceAtMost(mediaSize)
+                              val elapsedSec = ((System.currentTimeMillis() - startTime) / 1000.0).coerceAtLeast(0.5)
+                              val speed = (downloaded / elapsedSec).toLong()
+                              val pct = if (mediaSize > 0) ((downloaded * 100) / mediaSize).toInt().coerceIn(0, 99) else 0
+                              onProgress?.invoke(pct, downloaded, mediaSize, speed, "Downloading (${downloadedSegments.get()}/$totalSegments chunks)...")
+                              delay(500)
+                          }
+                      }
+
+                      try {
+                          downloadJobs.awaitAll()
+                      } finally {
+                          progressJob.cancel()
+                      }
+                  }
+
+                  onProgress?.invoke(99, mediaSize, mediaSize, 0L, "Merging video chunks...")
+                  config.outputFile?.let { mergeSegmentsIntoMp4File(tempDir.first, it) }
+                  onProgress?.invoke(100, mediaSize, mediaSize, 0L, "Saving to Downloads...")
+              }
+
+              private suspend fun downloadSegmentWithRetry(url: String, targetFile: File, bytesCounter: AtomicLong) {
+                  var lastError: Exception? = null
+                  repeat(MAX_RETRIES) { attempt ->
+                      try {
+                          if (targetFile.exists()) targetFile.delete()
+                          httpClientManager.openSegmentStream(url).use { response ->
+                              if (!response.isSuccessful) throw IOException("HTTP ${response.code}")
+                              val bodyStream = response.body?.byteStream() ?: throw IOException("Empty segment body")
+                              FileOutputStream(targetFile).use { fos ->
+                                  val buffer = ByteArray(65536)
+                                  var read: Int
+                                  while (bodyStream.read(buffer).also { read = it } != -1) {
+                                      fos.write(buffer, 0, read)
+                                      bytesCounter.addAndGet(read.toLong())
+                                  }
+                              }
+                          }
+                          return
+                      } catch (e: Exception) {
+                          lastError = e
+                          if (attempt < MAX_RETRIES - 1) delay(1000L * (attempt + 1))
+                      }
+                  }
+                  throw lastError ?: IOException("Segment download failed")
+              }
+
+              private fun mergeSegmentsIntoMp4File(segmentFolderPath: File, output: File) {
+                  val segmentFiles = segmentFolderPath.listFiles { file -> file.name.startsWith("segment_") }
+                      ?.toList()
+                      ?.sortedBy { it.name.removePrefix("segment_").toIntOrNull() }
+                      ?: emptyList()
+                  if (segmentFiles.isEmpty()) throw IOException("No downloaded chunks found")
+
+                  BufferedOutputStream(FileOutputStream(output), 262144).use { out ->
+                      val buffer = ByteArray(65536)
+                      for (seg in segmentFiles) {
+                          FileInputStream(seg).use { input ->
+                              var read: Int
+                              while (input.read(buffer).also { read = it } != -1) {
+                                  out.write(buffer, 0, read)
+                              }
+                          }
+                      }
+                      out.flush()
+                  }
+                  segmentFolderPath.listFiles()?.forEach { it.delete() }
+                  segmentFolderPath.delete()
+              }
+
+              fun getVideoMetaData(url: String, headers: Map<String, String?>?): Mp4? {
+                  val response = httpClientManager.makeHttpRequest(url, headers)
+                  val encryptedData = response?.body ?: return null
+                  return parseEncryptedMp4MetadataFromHtml(encryptedData)
+              }
+
+              private fun parseEncryptedMp4MetadataFromHtml(html: String): Mp4? {
+                  val jsCode = Jsoup.parse(html).select("script").find { it.html().contains("datas") }?.html() ?: return null
+                  val datasRegex = Regex("""const\s+datas\s*=\s*"([^"]*)"""")
+                  val datas = datasRegex.find(jsCode)?.groups?.get(1)?.value ?: return null
+                  val decodedDatas = String(Base64.getDecoder().decode(datas), Charsets.ISO_8859_1)
+                  val mediaMetadata = decodedDatas.toObject<Datas>()
+                  val encryptedMediaMetadata = mediaMetadata.media ?: return null
+
+                  val mediaKey = "${mediaMetadata.user_id}:${mediaMetadata.slug}:${mediaMetadata.md5_id}"
+                  val decryptionKey = cryptoHelper.getKey(mediaKey).toByteArray()
+                  return cryptoHelper.decryptString(encryptedMediaMetadata, decryptionKey)
+                      .toObject<Video>()
+                      .mp4?.copy(slug = mediaMetadata.slug, md5_id = mediaMetadata.md5_id)
+              }
+
+              private fun initializeDownloadTempDir(config: Config, simpleVideo: SimpleVideo?, totalSegments: Int): Pair<File, List<Int>> {
+                  val tempFolderName = "temp_${simpleVideo?.slug}_${simpleVideo?.label}"
+                  val tempFolder = File(config.outputFile?.parentFile, tempFolderName)
+                  if (tempFolder.exists() && tempFolder.isDirectory) {
+                      val existingSegments = tempFolder.listFiles { file ->
+                          if (file.isFile && file.name.matches(Regex("segment_\\d+")) && file.length() < FRAGMENT_SIZE_IN_BYTES) {
+                              file.delete()
+                          }
+                          file.isFile && file.name.matches(Regex("segment_\\d+"))
+                      }?.mapNotNull { it.name.removePrefix("segment_").toIntOrNull() }?.toSet() ?: emptySet()
+                      return tempFolder to (0 until totalSegments).filterNot { it in existingSegments }
+                  } else {
+                      tempFolder.mkdirs()
+                  }
+                  return tempFolder to emptyList()
+              }
+
+              private fun generateRanges(size: Long, step: Long = FRAGMENT_SIZE_IN_BYTES): List<LongRange> {
+                  val ranges = mutableListOf<LongRange>()
+                  if (size <= step) {
+                      ranges.add(0 until size)
+                      return ranges
+                  }
+                  var start = 0L
+                  while (start < size) {
+                      val end = minOf(start + step, size)
+                      ranges.add(start until end)
+                      start = end
+                  }
+                  return ranges
+              }
+
+              private fun generateSegmentTokens(simpleVideo: SimpleVideo?): Map<Int, String> {
+                  val fragmentList = mutableMapOf<Int, String>()
+                  val encryptionKey = cryptoHelper.getKey(simpleVideo?.size)
+                  if (simpleVideo?.size != null) {
+                      generateRanges(simpleVideo.size).forEachIndexed { index, _ ->
+                          val path = "/mp4/${simpleVideo.md5_id}/${simpleVideo.resId}/${simpleVideo.size}/$FRAGMENT_SIZE_IN_BYTES/$index"
+                          val encryptedBody = cryptoHelper.encryptAESCTR(path, encryptionKey)
+                          fragmentList[index] = doubleEncodeToBase64(encryptedBody)
+                      }
+                      return fragmentList
+                  }
+                  return emptyMap()
+              }
+
+              private fun doubleEncodeToBase64(input: String): String {
+                  val first = Base64.getEncoder().encodeToString(input.toByteArray(Charsets.ISO_8859_1)).replace("=", "")
+                  return Base64.getEncoder().encodeToString(first.toByteArray()).replace("=", "")
+              }
+          }
+          EOF
+
+          cat << 'EOF' > src/main/kotlin/com/abmo/providers/Animet3Provider.kt
+          package com.abmo.providers
+
+          import com.abmo.services.HttpClientManager
+          import com.abmo.util.fetchDocument
+          import com.abmo.util.getParameter
+          import com.abmo.util.toJsoupDocument
+          import org.koin.core.component.KoinComponent
+          import org.koin.core.component.inject
+
+          class Animet3Provider : Provider, KoinComponent {
+              private val httpClientManager: HttpClientManager by inject()
+              override fun getVideoID(url: String): String? {
+                  val regex = Regex("""MovieId\s*=\s*'(\d+)',\s*EpisodeId\s*=\s*'(\d+)',""")
+                  val matchResult = regex.find(url.fetchDocument().html()) ?: return null
+                  val response = httpClientManager.postForm(
+                      "https://anime11.site/ajax/player_hrx",
+                      "id=${matchResult.groupValues[1]}&ep=${matchResult.groupValues[2]}&sv=hrx-0"
+                  )
+                  return response.toJsoupDocument().select("iframe").attr("src").getParameter("v")
+              }
+          }
+          EOF
+
+          cat << 'EOF' > src/main/kotlin/com/abmo/providers/MotchillProvider.kt
+          package com.abmo.providers
+
+          import com.abmo.services.HttpClientManager
+          import com.abmo.util.fetchDocument
+          import com.abmo.util.getParameter
+          import com.abmo.util.toJsoupDocument
+          import org.koin.core.component.KoinComponent
+          import org.koin.core.component.inject
+
+          class MotchillProvider : Provider, KoinComponent {
+              private val httpClientManager: HttpClientManager by inject()
+              override fun getVideoID(url: String): String? {
+                  val queryParam = url.fetchDocument()
+                      .select("div.block-wrapper.text-center a")
+                      .find { it.toString().contains("type=hii") }
+                      ?.attr("data-href") ?: return null
+                  val response = httpClientManager.postForm(
+                      "https://motchill.taxi$queryParam",
+                      "",
+                      mapOf("x-requested-with" to "XMLHttpRequest", "Referer" to url)
+                  )
+                  return response.toJsoupDocument().getElementById("playerIframe")?.attr("src")?.getParameter("v")
+              }
+          }
+          EOF
+
+          cat << 'EOF' > src/main/kotlin/com/abmo/providers/TvphimProvider.kt
+          package com.abmo.providers
+
+          import com.abmo.executor.JavaScriptExecutor
+          import com.abmo.util.fetchDocument
+
+          class TvphimProvider(private val javaScriptExecutor: JavaScriptExecutor) : Provider {
+              override fun getVideoID(url: String): String? {
+                  val hProUrl = url.fetchDocument().select("a[title=\"Server H.PRO\"]").attr("href")
+                  if (hProUrl.isNullOrBlank()) return null
+                  val jsCode = hProUrl.fetchDocument().select("div[class=absolute inset-0]").select("script").html()
+                  return javaScriptExecutor.runJavaScriptCode(
+                      javascriptFileName = "tvphim.js",
+                      identifier = "extractVideoID",
+                      arguments = arrayOf(jsCode)
+                  )
+              }
+          }
+          EOF
+
+          cat << 'EOF' > src/main/kotlin/com/abmo/MainActivity.kt
+          package com.abmo
+
+          import android.Manifest
+          import android.app.Activity
+          import android.content.ClipboardManager
+          import android.content.ContentValues
+          import android.content.Context
+          import android.content.pm.PackageManager
+          import android.graphics.Color
+          import android.graphics.Typeface
+          import android.graphics.drawable.GradientDrawable
+          import android.os.Build
+          import android.os.Bundle
+          import android.os.Environment
+          import android.provider.MediaStore
+          import android.view.Gravity
+          import android.view.View
+          import android.view.WindowManager
+          import android.widget.*
+          import com.abmo.common.Constants.ABYSS_BASE_URL
+          import com.abmo.di.koinModule
+          import com.abmo.model.Config
+          import com.abmo.model.video.Mp4
+          import com.abmo.model.video.Source
+          import com.abmo.services.ProviderDispatcher
+          import com.abmo.services.VideoDownloader
+          import com.abmo.util.extractReferer
+          import com.abmo.util.formatAsReadableSize
+          import com.abmo.util.isValidUrl
+          import kotlinx.coroutines.*
+          import org.koin.core.context.GlobalContext
+          import org.koin.core.context.startKoin
+          import java.io.File
+          import java.io.FileInputStream
+          import java.io.FileOutputStream
+
+          class MainActivity : Activity() {
+              private val scope = CoroutineScope(Dispatchers.Main + SupervisorJob())
+              private lateinit var urlInput: EditText
+              private lateinit var threadsText: TextView
+              private lateinit var threadsSeekBar: SeekBar
+              private lateinit var fetchBtn: Button
+              private lateinit var formatsContainer: LinearLayout
+              private lateinit var statusText: TextView
+              private lateinit var progressBar: ProgressBar
+              private lateinit var progressDetailText: TextView
+
+              private var currentMetadata: Mp4? = null
+              private var currentAbyssUrl: String = ""
+              private var currentHeaders: Map<String, String> = emptyMap()
+              private var currentVideoId: String = ""
+              private var isDownloading = false
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  if (GlobalContext.getOrNull() == null) {
+                      startKoin { modules(koinModule) }
+                  }
+                  if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
+                      if (checkSelfPermission(Manifest.permission.WRITE_EXTERNAL_STORAGE) != PackageManager.PERMISSION_GRANTED) {
+                          requestPermissions(arrayOf(Manifest.permission.WRITE_EXTERNAL_STORAGE), 101)
+                      }
+                  }
+                  buildUi()
+              }
+
+              private fun dp(v: Int): Int = (v * resources.displayMetrics.density).toInt()
+              private fun cardBg(colorHex: String, radiusDp: Int = 14) = GradientDrawable().apply {
+                  setColor(Color.parseColor(colorHex))
+                  cornerRadius = dp(radiusDp).toFloat()
+              }
+
+              private fun buildUi() {
+                  val scroll = ScrollView(this).apply {
+                      setBackgroundColor(Color.parseColor("#0F172A"))
+                      isFillViewport = true
+                  }
+                  val root = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      setPadding(dp(20), dp(28), dp(20), dp(28))
+                  }
+                  val title = TextView(this).apply {
+                      text = "Abyss Video Downloader"
+                      textSize = 24f
+                      setTypeface(null, Typeface.BOLD)
+                      setTextColor(Color.WHITE)
+                  }
+                  val subtitle = TextView(this).apply {
+                      text = "All qualities • Multi-thread high speed • Save to Downloads"
+                      textSize = 13f
+                      setTextColor(Color.parseColor("#94A3B8"))
+                      setPadding(0, dp(4), 0, dp(18))
+                  }
+                  urlInput = EditText(this).apply {
+                      hint = "Paste Abyss URL or Video ID (e.g. K8R6OOjS7)"
+                      setHintTextColor(Color.parseColor("#64748B"))
+                      setTextColor(Color.WHITE)
+                      background = cardBg("#1E293B", 12)
+                      setPadding(dp(14), dp(14), dp(14), dp(14))
+                      isSingleLine = true
+                  }
+                  val btnRow = LinearLayout(this).apply {
+                      orientation = LinearLayout.HORIZONTAL
+                      setPadding(0, dp(10), 0, dp(14))
+                  }
+                  val pasteBtn = Button(this).apply {
+                      text = "Paste"
+                      setTextColor(Color.WHITE)
+                      background = cardBg("#334155", 10)
+                      layoutParams = LinearLayout.LayoutParams(0, dp(48), 1f).apply { rightMargin = dp(8) }
+                      setOnClickListener {
+                          val cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                          val clip = cm.primaryClip?.getItemAt(0)?.text?.toString()?.trim()
+                          if (!clip.isNullOrEmpty()) urlInput.setText(clip)
+                      }
+                  }
+                  fetchBtn = Button(this).apply {
+                      text = "Fetch Qualities"
+                      setTextColor(Color.WHITE)
+                      setTypeface(null, Typeface.BOLD)
+                      background = cardBg("#2563EB", 10)
+                      layoutParams = LinearLayout.LayoutParams(0, dp(48), 2f)
+                      setOnClickListener { fetchFormats() }
+                  }
+                  btnRow.addView(pasteBtn)
+                  btnRow.addView(fetchBtn)
+
+                  val threadCard = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      background = cardBg("#1E293B", 12)
+                      setPadding(dp(14), dp(12), dp(14), dp(12))
+                  }
+                  threadsText = TextView(this).apply {
+                      text = "Download Speed Threads: 8 (High Speed)"
+                      textSize = 14f
+                      setTextColor(Color.parseColor("#E2E8F0"))
+                  }
+                  threadsSeekBar = SeekBar(this).apply {
+                      max = 9
+                      progress = 7
+                      setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                          override fun onProgressChanged(sb: SeekBar?, p: Int, fromUser: Boolean) {
+                              val t = p + 1
+                              threadsText.text = "Download Speed Threads: $t ${if (t >= 8) "(High Speed)" else ""}"
+                          }
+                          override fun onStartTrackingTouch(sb: SeekBar?) {}
+                          override fun onStopTrackingTouch(sb: SeekBar?) {}
+                      })
+                  }
+                  threadCard.addView(threadsText)
+                  threadCard.addView(threadsSeekBar)
+
+                  statusText = TextView(this).apply {
+                      text = "Ready. Paste a link and tap Fetch Qualities."
+                      textSize = 14f
+                      setTextColor(Color.parseColor("#CBD5E1"))
+                      setPadding(0, dp(16), 0, dp(8))
+                  }
+                  progressBar = ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal).apply {
+                      max = 100
+                      progress = 0
+                      visibility = View.GONE
+                  }
+                  progressDetailText = TextView(this).apply {
+                      textSize = 13f
+                      setTextColor(Color.parseColor("#38BDF8"))
+                      setPadding(0, dp(4), 0, dp(12))
+                      visibility = View.GONE
+                  }
+                  formatsContainer = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      setPadding(0, dp(8), 0, dp(16))
+                  }
+                  root.addView(title); root.addView(subtitle); root.addView(urlInput)
+                  root.addView(btnRow); root.addView(threadCard); root.addView(statusText)
+                  root.addView(progressBar); root.addView(progressDetailText); root.addView(formatsContainer)
+                  scroll.addView(root)
+                  setContentView(scroll)
+              }
+
+              private fun fetchFormats() {
+                  if (isDownloading) return
+                  val raw = urlInput.text.toString().trim()
+                  if (raw.isEmpty()) {
+                      Toast.makeText(this, "Enter a video URL or ID", Toast.LENGTH_SHORT).show()
+                      return
+                  }
+                  formatsContainer.removeAllViews()
+                  statusText.text = "Fetching available qualities..."
+                  fetchBtn.isEnabled = false
+
+                  scope.launch {
+                      try {
+                          val dispatcher = GlobalContext.get().get<ProviderDispatcher>()
+                          val downloader = GlobalContext.get().get<VideoDownloader>()
+                          val result = withContext(Dispatchers.IO) {
+                              val videoId = dispatcher.getProviderForUrl(raw).getVideoID(raw)
+                                  ?: throw Exception("Could not extract Video ID")
+                              val headers = if (raw.isValidUrl()) {
+                                  mapOf("Referer" to (raw.extractReferer() ?: "$ABYSS_BASE_URL/"))
+                              } else {
+                                  mapOf("Referer" to "$ABYSS_BASE_URL/")
+                              }
+                              val abyssUrl = "$ABYSS_BASE_URL/?v=$videoId"
+                              val meta = downloader.getVideoMetaData(abyssUrl, headers)
+                                  ?: throw Exception("Video not found or blocked by server")
+                              Triple(videoId, abyssUrl, headers) to meta
+                          }
+                          currentVideoId = result.first.first
+                          currentAbyssUrl = result.first.second
+                          currentHeaders = result.first.third
+                          currentMetadata = result.second
+
+                          val sources = result.second.sources?.filterNotNull()?.sortedByDescending { it.size ?: 0L } ?: emptyList()
+                          if (sources.isEmpty()) {
+                              statusText.text = "No downloadable formats found."
+                          } else {
+                              statusText.text = "Found ${sources.size} format(s) for $currentVideoId. Tap one to download:"
+                              sources.forEach { addFormatButton(it) }
+                          }
+                      } catch (e: Exception) {
+                          statusText.text = "Error: ${e.message}"
+                      } finally {
+                          fetchBtn.isEnabled = true
+                      }
+                  }
+              }
+
+              private fun addFormatButton(source: Source) {
+                  val label = source.label ?: "Unknown"
+                  val sizeStr = source.size.formatAsReadableSize()
+                  val btn = Button(this).apply {
+                      text = "Download $label  ($sizeStr)"
+                      setTextColor(Color.WHITE)
+                      setTypeface(null, Typeface.BOLD)
+                      gravity = Gravity.CENTER
+                      background = cardBg("#059669", 12)
+                      layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(52)).apply {
+                          bottomMargin = dp(10)
+                      }
+                      setOnClickListener { startDownload(label) }
+                  }
+                  formatsContainer.addView(btn)
+              }
+
+              private fun startDownload(resolutionLabel: String) {
+                  if (isDownloading) return
+                  val metadata = currentMetadata ?: return
+                  isDownloading = true
+                  fetchBtn.isEnabled = false
+                  window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+                  progressBar.visibility = View.VISIBLE
+                  progressDetailText.visibility = View.VISIBLE
+                  progressBar.progress = 0
+                  val threads = threadsSeekBar.progress + 1
+                  statusText.text = "Starting $resolutionLabel with $threads threads..."
+
+                  scope.launch {
+                      val tempOutput = File(cacheDir, "${currentVideoId}_${resolutionLabel}_${System.currentTimeMillis()}.mp4")
+                      try {
+                          val downloader = GlobalContext.get().get<VideoDownloader>()
+                          val config = Config(currentAbyssUrl, resolutionLabel, tempOutput, currentHeaders, threads)
+                          withContext(Dispatchers.IO) {
+                              downloader.downloadSegmentsInParallel(config, metadata) { pct, down, total, speed, msg ->
+                                  scope.launch(Dispatchers.Main) {
+                                      progressBar.progress = pct
+                                      statusText.text = msg
+                                      progressDetailText.text = "$pct%  •  ${down.formatAsReadableSize()} / ${total.formatAsReadableSize()}  •  ${speed.formatAsReadableSize()}/s"
+                                  }
+                              }
+                          }
+                          val savedName = "${currentVideoId}_${resolutionLabel}.mp4"
+                          withContext(Dispatchers.IO) { saveToDownloads(tempOutput, savedName) }
+                          progressBar.progress = 100
+                          statusText.text = "Saved to Downloads/AbyssDownloader/$savedName"
+                          Toast.makeText(this@MainActivity, "Download Complete!", Toast.LENGTH_LONG).show()
+                      } catch (e: Exception) {
+                          statusText.text = "Download failed: ${e.message}"
+                          if (tempOutput.exists()) tempOutput.delete()
+                      } finally {
+                          isDownloading = false
+                          fetchBtn.isEnabled = true
+                          window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+                      }
+                  }
+              }
+
+              private fun saveToDownloads(sourceFile: File, fileName: String) {
+                  if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                      val values = ContentValues().apply {
+                          put(MediaStore.Downloads.DISPLAY_NAME, fileName)
+                          put(MediaStore.Downloads.MIME_TYPE, "video/mp4")
+                          put(MediaStore.Downloads.RELATIVE_PATH, "${Environment.DIRECTORY_DOWNLOADS}/AbyssDownloader")
+                      }
+                      val uri = contentResolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
+                          ?: throw Exception("Failed to create MediaStore entry")
+                      contentResolver.openOutputStream(uri)?.use { out ->
+                          FileInputStream(sourceFile).use { input -> input.copyTo(out) }
+                      }
+                  } else {
+                      val dir = File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS), "AbyssDownloader")
+                      if (!dir.exists()) dir.mkdirs()
+                      FileInputStream(sourceFile).use { input ->
+                          FileOutputStream(File(dir, fileName)).use { out -> input.copyTo(out) }
+                      }
+                  }
+                  sourceFile.delete()
+              }
+
+              override fun onDestroy() {
+                  super.onDestroy()
+                  scope.cancel()
+              }
+          }
+          EOF
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Make gradlew executable
+        run: chmod +x gradlew
+
+      - name: Build Android APK
+        run: ./gradlew assembleDebug
+
+      - name: Rename APK
+        run: cp build/outputs/apk/debug/*.apk AbyssDownloader.apk
+
+      - name: Upload APK Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: AbyssDownloader-APK
+          path: AbyssDownloader.apk
+
+      - name: Publish Public Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v1.0-${{ github.run_number }}
+          name: AbyssDownloader APK v1.0-${{ github.run_number }}
+          files: AbyssDownloader.apk
+          draft: false
