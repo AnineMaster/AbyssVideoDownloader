@@ -19,10 +19,8 @@ jobs:
 
       - name: Auto-Patch Project for Android
         run: |
-          mkdir -p 
+          mkdir -p src/main/kotlin/com/abmo/services src/main/kotlin/com/abmo/providers
           sed -i 's/gradle-8.5-bin.zip/gradle-8.6-bin.zip/g' gradle/wrapper/gradle-wrapper.properties
-          src/main/kotlin/com/abmo/services
-          src/main/kotlin/com/abmo/providers
 
           cat << 'EOF' > settings.gradle.kts
           pluginManagement {
